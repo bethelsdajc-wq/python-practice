@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """
-Lyric Scrubber — run it, paste lyrics, get clean output.
+Lyric Scrubber — GUI edition (dark theme).
 
-  python lyric_scrub.py          ← interactive (this is what you want)
-  python lyric_scrub.py raw.txt  ← one-shot on a file
-  pbpaste | python lyric_scrub.py ← one-shot on stdin
+  python lyric_scrub.py     (or double-click the file)
+
+Paste lyrics in the left box, Ctrl+Enter to scrub, output on the right.
 """
 
-# ════════════════════════════════════════════════════════════════════════
-#  ▼▼▼  DROP YOUR TOKEN HERE  ▼▼▼
-API_KEY = "sk-58d0cf9cefbf4c398817c3672b283fc4"              # "sk-..."  — leave "" to be asked once at startup
-# ════════════════════════════════════════════════════════════════════════
-
-import getpass
 import json
 import os
-import re 
-import sys
+import re
+import threading
 import time
 from urllib import error, request
+
+import tkinter as tk
+from tkinter import font as tkfont, messagebox
+
+# ════════════════════════════════════════════════════════════════════════
+#  ▼▼▼  DEFAULT API KEY (optional — you can also type it in the window) ▼
+DEFAULT_API_KEY = ""          # "sk-..." or leave "" and fill the field
+# ════════════════════════════════════════════════════════════════════════
 
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEFAULT_MODEL = "deepseek-chat"
@@ -222,108 +224,208 @@ def call_deepseek(text, api_key, model=DEFAULT_MODEL, timeout=180, retries=3):
     raise RuntimeError(f"DeepSeek request failed: {last}")
 
 
-def scrub(raw, api_key, model=DEFAULT_MODEL, repeat_label="Chorus", verbose=False):
+def scrub(raw, api_key, model=DEFAULT_MODEL, repeat_label="Chorus"):
     cleaned = preclean(raw)
     if not cleaned.strip():
         raise ValueError("nothing left after pre-cleaning — no lyrics found")
     if api_key:
-        try:
-            out = strip_fences(call_deepseek(cleaned, api_key, model=model))
-            if out.upper().startswith("NO_LYRICS"):
-                raise ValueError("model reported no lyrics")
-            rendered = render(parse_sections(out))
-            if rendered.strip():
-                return rendered
-            raise ValueError("model output unparseable")
-        except Exception as e:  # noqa: BLE001
-            if verbose:
-                print(f"[warn] API failed ({e}); using local heuristics.", file=sys.stderr)
+        out = strip_fences(call_deepseek(cleaned, api_key, model=model))
+        if out.upper().startswith("NO_LYRICS"):
+            raise ValueError("model reported no lyrics")
+        rendered = render(parse_sections(out))
+        if rendered.strip():
+            return rendered
+        raise ValueError("model output unparseable")
     rendered = format_local(cleaned, repeat_label)
     if not rendered.strip():
         raise ValueError("could not extract any lyrics")
     return rendered
 
 
-# ── token ───────────────────────────────────────────────────────────────
-def resolve_key():
-    key = API_KEY.strip() or os.environ.get("DEEPSEEK_API_KEY", "").strip()
-    if key:
-        return key
-    try:
-        key = getpass.getpass("DeepSeek API key (hidden, blank = local only): ").strip()
-    except Exception:
-        key = ""
-    return key
+# ────────────────────────────────────────────────────────────────────────
+#  GUI — fully explicit colors so system dark mode can't break contrast
+# ────────────────────────────────────────────────────────────────────────
 
+class App:
+    # Palette (VS Code-ish dark)
+    BG        = "#1e1e1e"   # window
+    PANEL     = "#252526"   # text panels
+    FG        = "#d4d4d4"   # body text
+    FG_DIM    = "#888888"   # status text
+    BORDER    = "#3c3c3c"   # 1px borders / paned divider
+    ACCENT    = "#0e639c"   # hover / active button
+    ENTRY_BG  = "#2d2d30"   # api-key field
+    SEL_BG    = "#264f78"   # selection
+    SEL_FG    = "#ffffff"
 
-# ── interactive entry ──────────────────────────────────────────────────
-def read_block():
-    """Read lines until END / EOF. Blank lines are preserved."""
-    lines = []
-    while True:
+    def __init__(self, root):
+        self.root = root
+        self.busy = False
+        root.title("Lyric Scrubber")
+        root.geometry("1180x720")
+        root.minsize(760, 480)
+        root.configure(bg=self.BG)
+
+        # Fonts (explicit so system defaults can't override)
+        self.base_font = tkfont.nametofont("TkDefaultFont").copy()
+        self.base_font.configure(size=12)
+        self.bold_font = self.base_font.copy()
+        self.bold_font.configure(weight="bold")
+
+        # ── API key row ────────────────────────────────────────────────
+        top = tk.Frame(root, bg=self.BG)
+        top.pack(fill="x", padx=12, pady=(12, 0))
+        tk.Label(top, text="DeepSeek API key:", bg=self.BG, fg=self.FG,
+                 font=self.base_font).pack(side="left")
+
+        self.key_var = tk.StringVar(
+            value=os.environ.get("DEEPSEEK_API_KEY", DEFAULT_API_KEY).strip()
+        )
+        self.key_entry = tk.Entry(
+            top, textvariable=self.key_var, show="•",
+            bg=self.ENTRY_BG, fg=self.FG,
+            insertbackground=self.FG,                # cursor color
+            selectbackground=self.SEL_BG, selectforeground=self.SEL_FG,
+            disabledbackground=self.ENTRY_BG, disabledforeground=self.FG_DIM,
+            relief="flat", bd=0,
+            highlightthickness=1,
+            highlightbackground=self.BORDER,
+            highlightcolor=self.ACCENT,
+            font=self.base_font,
+        )
+        self.key_entry.pack(side="left", fill="x", expand=True,
+                            padx=(10, 0), ipady=4, ipadx=6)
+
+        # ── side-by-side panels ────────────────────────────────────────
+        pane = tk.PanedWindow(
+            root, orient="horizontal",
+            bg=self.BORDER,                # this color shows through the sash
+            bd=0, relief="flat",
+            sashwidth=6, sashrelief="flat", sashpad=0,
+        )
+        pane.pack(fill="both", expand=True, padx=12, pady=12)
+
+        left_frame, self.input = self._make_panel(pane, " Raw lyrics — paste here ")
+        right_frame, self.output = self._make_panel(pane, " Scrubbed output ")
+        pane.add(left_frame, minsize=200, stretch="always")
+        pane.add(right_frame, minsize=200, stretch="always")
+
+        # ── bottom bar ─────────────────────────────────────────────────
+        bar = tk.Frame(root, bg=self.BG)
+        bar.pack(fill="x", padx=12, pady=(0, 12))
+
+        self.scrub_btn = self._make_button(bar, "Scrub  (Ctrl+Enter)", self.do_scrub)
+        self.scrub_btn.pack(side="left")
+        self._make_button(bar, "Copy output", self.copy_out).pack(side="left", padx=(8, 0))
+        self._make_button(bar, "Clear", self.clear).pack(side="left", padx=(8, 0))
+
+        self.status = tk.Label(bar, text="Ready.", bg=self.BG, fg=self.FG_DIM,
+                               font=self.base_font, anchor="e")
+        self.status.pack(side="right")
+
+        # ── bindings ───────────────────────────────────────────────────
+        for seq in ("<Control-Return>", "<Command-Return>"):
+            self.input.bind(seq, self._on_shortcut)
+        self.input.focus_set()
+
+    # ── widget factories ──────────────────────────────────────────────
+    def _make_panel(self, parent, title):
+        lf = tk.LabelFrame(
+            parent, text=title,
+            bg=self.BG, fg=self.FG, font=self.bold_font,
+            bd=0, highlightthickness=1, highlightbackground=self.BORDER,
+        )
+        text = tk.Text(
+            lf, wrap="word", undo=True, font=self.base_font,
+            bg=self.PANEL, fg=self.FG,
+            insertbackground=self.FG,
+            selectbackground=self.SEL_BG, selectforeground=self.SEL_FG,
+            relief="flat", bd=0, padx=10, pady=10,
+            highlightthickness=0,
+            spacing1=2, spacing3=2,
+        )
+        sb = tk.Scrollbar(
+            lf, command=text.yview, orient="vertical",
+            bg=self.PANEL, troughcolor=self.BG,
+            activebackground=self.ACCENT,
+            highlightthickness=0, relief="flat", bd=0, width=12,
+        )
+        text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y", padx=(0, 2), pady=2)
+        text.pack(side="left", fill="both", expand=True, padx=2, pady=2)
+        return lf, text
+
+    def _make_button(self, parent, text, cmd):
+        return tk.Button(
+            parent, text=text, command=cmd,
+            bg=self.PANEL, fg=self.FG,
+            activebackground=self.ACCENT, activeforeground=self.SEL_FG,
+            disabledforeground=self.FG_DIM,
+            relief="flat", bd=0,
+            padx=14, pady=5,
+            highlightthickness=0,
+            font=self.base_font, cursor="hand2",
+        )
+
+    def _on_shortcut(self, _event=None):
+        self.do_scrub()
+        return "break"
+
+    # ── actions ───────────────────────────────────────────────────────
+    def do_scrub(self):
+        if self.busy:
+            return
+        raw = self.input.get("1.0", "end").strip()
+        if not raw:
+            self._set_status("Nothing to scrub.")
+            return
+        key = self.key_var.get().strip()
+        self.busy = True
+        self.scrub_btn.config(state="disabled")
+        self._set_status("Scrubbing…")
+        threading.Thread(target=self._worker, args=(raw, key), daemon=True).start()
+
+    def _worker(self, raw, key):
         try:
-            line = input()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if line.strip().upper() == "END":
-            break
-        lines.append(line)
-    return "\n".join(lines)
+            out, err = scrub(raw, api_key=key), None
+        except Exception as e:  # noqa: BLE001
+            out, err = "", str(e)
+        self.root.after(0, lambda: self._finish(out, err))
+
+    def _finish(self, out, err):
+        self.busy = False
+        self.scrub_btn.config(state="normal")
+        if err:
+            self._set_status("Error.")
+            messagebox.showerror("Scrub failed", err)
+            return
+        self.output.delete("1.0", "end")
+        self.output.insert("1.0", out)
+        self._set_status(f"Done — {len(out.splitlines())} lines.")
+
+    def copy_out(self):
+        txt = self.output.get("1.0", "end").rstrip("\n")
+        if not txt:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(txt)
+        self._set_status("Copied to clipboard.")
+
+    def clear(self):
+        self.input.delete("1.0", "end")
+        self.output.delete("1.0", "end")
+        self._set_status("Ready.")
+        self.input.focus_set()
+
+    def _set_status(self, s):
+        self.status.config(text=s)
 
 
-def run_once(raw, key, model=DEFAULT_MODEL):
-    try:
-        out = scrub(raw, api_key=key, model=model, verbose=True)
-    except Exception as e:  # noqa: BLE001
-        print(f"\n⚠️  {e}\n", file=sys.stderr)
-        return
-    print()
-    print("═" * 60)
-    print(out.rstrip())
-    print("═" * 60)
-
-
-def playground():
-    key = resolve_key()
-    print()
-    print("  Lyric Scrubber")
-    print("  " + "─" * 46)
-    print("  Paste lyrics below, then type  END  on its own line.")
-    print("  (On Windows you can also press Ctrl-Z then Enter.)")
-    print("  Ctrl-C to quit.")
-    while True:
-        print()
-        print("┌─ paste lyrics ─────────────────────────────")
-        block = read_block()
-        if not block.strip():
-            print("└─ (empty, done)")
-            break
-        print(f"└─ {len(block.splitlines())} lines received ─────────────")
-        run_once(block, key)
-        try:
-            more = input("Another song? [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not more.startswith("y"):
-            break
-    print("\nbye.")
-
-
-def main(argv):
-    if len(argv) > 1 and argv[1] != "-":
-        raw = open(argv[1], "r", encoding="utf-8").read()
-        run_once(raw, resolve_key())
-        return 0
-    if not sys.stdin.isatty():
-        run_once(sys.stdin.read(), resolve_key())
-        return 0
-    playground()
-    return 0
+def main():
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main(sys.argv))
-    except KeyboardInterrupt:
-        print("\nbye.")
-        sys.exit(130)
+    main()
