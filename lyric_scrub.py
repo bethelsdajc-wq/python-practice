@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lyric Scrubber — GUI edition (dark theme).
+Lyric Scrubber — GUI edition (dark theme, no threads).
 
   python lyric_scrub.py     (or double-click the file)
 
@@ -10,7 +10,6 @@ Paste lyrics in the left box, Ctrl+Enter to scrub, output on the right.
 import json
 import os
 import re
-import threading
 import time
 from urllib import error, request
 
@@ -243,19 +242,19 @@ def scrub(raw, api_key, model=DEFAULT_MODEL, repeat_label="Chorus"):
 
 
 # ────────────────────────────────────────────────────────────────────────
-#  GUI — fully explicit colors so system dark mode can't break contrast
+#  GUI — synchronous (no threads; works in sandboxes that block them)
 # ────────────────────────────────────────────────────────────────────────
 
 class App:
     # Palette (VS Code-ish dark)
-    BG        = "#1e1e1e"   # window
-    PANEL     = "#252526"   # text panels
-    FG        = "#d4d4d4"   # body text
-    FG_DIM    = "#888888"   # status text
-    BORDER    = "#3c3c3c"   # 1px borders / paned divider
-    ACCENT    = "#0e639c"   # hover / active button
-    ENTRY_BG  = "#2d2d30"   # api-key field
-    SEL_BG    = "#264f78"   # selection
+    BG        = "#1e1e1e"
+    PANEL     = "#252526"
+    FG        = "#d4d4d4"
+    FG_DIM    = "#888888"
+    BORDER    = "#3c3c3c"
+    ACCENT    = "#0e639c"
+    ENTRY_BG  = "#2d2d30"
+    SEL_BG    = "#264f78"
     SEL_FG    = "#ffffff"
 
     def __init__(self, root):
@@ -266,7 +265,6 @@ class App:
         root.minsize(760, 480)
         root.configure(bg=self.BG)
 
-        # Fonts (explicit so system defaults can't override)
         self.base_font = tkfont.nametofont("TkDefaultFont").copy()
         self.base_font.configure(size=12)
         self.bold_font = self.base_font.copy()
@@ -284,7 +282,7 @@ class App:
         self.key_entry = tk.Entry(
             top, textvariable=self.key_var, show="•",
             bg=self.ENTRY_BG, fg=self.FG,
-            insertbackground=self.FG,                # cursor color
+            insertbackground=self.FG,
             selectbackground=self.SEL_BG, selectforeground=self.SEL_FG,
             disabledbackground=self.ENTRY_BG, disabledforeground=self.FG_DIM,
             relief="flat", bd=0,
@@ -299,8 +297,7 @@ class App:
         # ── side-by-side panels ────────────────────────────────────────
         pane = tk.PanedWindow(
             root, orient="horizontal",
-            bg=self.BORDER,                # this color shows through the sash
-            bd=0, relief="flat",
+            bg=self.BORDER, bd=0, relief="flat",
             sashwidth=6, sashrelief="flat", sashpad=0,
         )
         pane.pack(fill="both", expand=True, padx=12, pady=12)
@@ -323,7 +320,6 @@ class App:
                                font=self.base_font, anchor="e")
         self.status.pack(side="right")
 
-        # ── bindings ───────────────────────────────────────────────────
         for seq in ("<Control-Return>", "<Command-Return>"):
             self.input.bind(seq, self._on_shortcut)
         self.input.focus_set()
@@ -379,26 +375,35 @@ class App:
         if not raw:
             self._set_status("Nothing to scrub.")
             return
+
         key = self.key_var.get().strip()
         self.busy = True
         self.scrub_btn.config(state="disabled")
-        self._set_status("Scrubbing…")
-        threading.Thread(target=self._worker, args=(raw, key), daemon=True).start()
+        self._set_status("Scrubbing…  (this can take a few seconds)")
+        # Force the "Scrubbing…" state onto the screen before we block.
+        try:
+            self.root.update()          # repaint now (safe; self.busy guards re-entry)
+        except Exception:
+            pass
 
-    def _worker(self, raw, key):
         try:
             out, err = scrub(raw, api_key=key), None
         except Exception as e:  # noqa: BLE001
             out, err = "", str(e)
-        self.root.after(0, lambda: self._finish(out, err))
 
-    def _finish(self, out, err):
         self.busy = False
         self.scrub_btn.config(state="normal")
+
         if err:
             self._set_status("Error.")
-            messagebox.showerror("Scrub failed", err)
+            try:
+                messagebox.showerror("Scrub failed", err)
+            except Exception:
+                # some IDE shims don't implement messagebox — fall back to the box
+                self.output.delete("1.0", "end")
+                self.output.insert("1.0", f"ERROR: {err}")
             return
+
         self.output.delete("1.0", "end")
         self.output.insert("1.0", out)
         self._set_status(f"Done — {len(out.splitlines())} lines.")
