@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Lyric Scrubber — GUI edition (dark theme, no threads).
+Lyric Scrubber — GUI edition (dark theme, no threads, SSL-aware).
 
   python lyric_scrub.py     (or double-click the file)
 
 Paste lyrics in the left box, Ctrl+Enter to scrub, output on the right.
+If this environment has no SSL, the API is skipped and local
+heuristic labeling is used instead (a banner says so).
 """
 
 import json
@@ -18,11 +20,19 @@ from tkinter import font as tkfont, messagebox
 
 # ════════════════════════════════════════════════════════════════════════
 #  ▼▼▼  DEFAULT API KEY (optional — you can also type it in the window) ▼
-DEFAULT_API_KEY = "sk-58d0cf9cefbf4c398817c3672b283fc4"          # "sk-..." or leave "" and fill the field
+DEFAULT_API_KEY = "sk-666e0ff226df4507aa087622907651c2"          # "sk-..." or leave "" and fill the field
 # ════════════════════════════════════════════════════════════════════════
 
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEFAULT_MODEL = "deepseek-chat"
+
+# Detect SSL. Without it, urllib cannot speak https at all
+# (error: "unknown url type: https").
+try:
+    import ssl  # noqa: F401
+    _HAS_SSL = True
+except Exception:
+    _HAS_SSL = False
 
 # ────────────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = r"""You are a lyrics scrubber and formatter. The user gives you raw text copied from a lyrics website (usually Genius). It is usually polluted.
@@ -195,6 +205,11 @@ def strip_fences(s):
 
 
 def call_deepseek(text, api_key, model=DEFAULT_MODEL, timeout=180, retries=3):
+    if not _HAS_SSL:
+        raise RuntimeError(
+            "This Python has no SSL support, so HTTPS requests are impossible here. "
+            "Run the script locally (or in Replit/Colab/Codespaces) to use the API."
+        )
     payload = json.dumps({
         "model": model,
         "temperature": 0.2,
@@ -218,35 +233,46 @@ def call_deepseek(text, api_key, model=DEFAULT_MODEL, timeout=180, retries=3):
             if e.code in (429, 500, 502, 503, 504):
                 time.sleep(2 ** attempt); continue
             break
+        except error.URLError as e:
+            # Non-retryable scheme problem (the ssl case) — fail fast.
+            if "unknown url type" in str(e).lower():
+                raise RuntimeError(
+                    "HTTPS is not available in this Python build "
+                    "(unknown url type: https). Run locally to use the API."
+                ) from e
+            last = str(e); time.sleep(2 ** attempt)
         except Exception as e:  # noqa: BLE001
             last = str(e); time.sleep(2 ** attempt)
     raise RuntimeError(f"DeepSeek request failed: {last}")
 
 
 def scrub(raw, api_key, model=DEFAULT_MODEL, repeat_label="Chorus"):
+    """Return (lyrics, used_api)."""
     cleaned = preclean(raw)
     if not cleaned.strip():
         raise ValueError("nothing left after pre-cleaning — no lyrics found")
-    if api_key:
+
+    use_api = bool(api_key) and _HAS_SSL
+    if use_api:
         out = strip_fences(call_deepseek(cleaned, api_key, model=model))
         if out.upper().startswith("NO_LYRICS"):
             raise ValueError("model reported no lyrics")
         rendered = render(parse_sections(out))
         if rendered.strip():
-            return rendered
+            return rendered, True
         raise ValueError("model output unparseable")
+
     rendered = format_local(cleaned, repeat_label)
     if not rendered.strip():
         raise ValueError("could not extract any lyrics")
-    return rendered
+    return rendered, False
 
 
 # ────────────────────────────────────────────────────────────────────────
-#  GUI — synchronous (no threads; works in sandboxes that block them)
+#  GUI
 # ────────────────────────────────────────────────────────────────────────
 
 class App:
-    # Palette (VS Code-ish dark)
     BG        = "#1e1e1e"
     PANEL     = "#252526"
     FG        = "#d4d4d4"
@@ -256,6 +282,7 @@ class App:
     ENTRY_BG  = "#2d2d30"
     SEL_BG    = "#264f78"
     SEL_FG    = "#ffffff"
+    WARN      = "#e0a030"
 
     def __init__(self, root):
         self.root = root
@@ -294,6 +321,19 @@ class App:
         self.key_entry.pack(side="left", fill="x", expand=True,
                             padx=(10, 0), ipady=4, ipadx=6)
 
+        # ── SSL banner (only visible when SSL is missing) ──────────────
+        if not _HAS_SSL:
+            banner = tk.Label(
+                root,
+                text=("  This environment has no SSL — HTTPS is disabled. "
+                      "Scrub uses local labeling only. "
+                      "Run locally (or on Replit/Colab/Codespaces) to use the API.  "),
+                bg="#4a3a10", fg=self.WARN,
+                font=self.base_font, anchor="w", justify="left",
+                wraplength=1100,
+            )
+            banner.pack(fill="x", padx=12, pady=(8, 0))
+
         # ── side-by-side panels ────────────────────────────────────────
         pane = tk.PanedWindow(
             root, orient="horizontal",
@@ -316,7 +356,8 @@ class App:
         self._make_button(bar, "Copy output", self.copy_out).pack(side="left", padx=(8, 0))
         self._make_button(bar, "Clear", self.clear).pack(side="left", padx=(8, 0))
 
-        self.status = tk.Label(bar, text="Ready.", bg=self.BG, fg=self.FG_DIM,
+        initial = "Ready." if _HAS_SSL else "Ready.  (local mode — no SSL in this environment)"
+        self.status = tk.Label(bar, text=initial, bg=self.BG, fg=self.FG_DIM,
                                font=self.base_font, anchor="e")
         self.status.pack(side="right")
 
@@ -379,34 +420,60 @@ class App:
         key = self.key_var.get().strip()
         self.busy = True
         self.scrub_btn.config(state="disabled")
-        self._set_status("Scrubbing…  (this can take a few seconds)")
-        # Force the "Scrubbing…" state onto the screen before we block.
+
+        note = ""
+        if key and not _HAS_SSL:
+            note = "[local mode — SSL unavailable in this environment, API skipped]\n\n"
+            self._set_status("Scrubbing locally…")
+        elif key:
+            self._set_status("Scrubbing…  (this can take a few seconds)")
+        else:
+            self._set_status("Scrubbing locally…")
+
         try:
-            self.root.update()          # repaint now (safe; self.busy guards re-entry)
+            self.root.update()   # paint the status before we block
         except Exception:
             pass
 
         try:
-            out, err = scrub(raw, api_key=key), None
+            out, used_api = scrub(raw, api_key=key), True
+        except TypeError:
+            # scrub returns a tuple in this build; catch the unpack cleanly
+            try:
+                out, used_api = scrub(raw, api_key=key)
+            except Exception as e:  # noqa: BLE001
+                out, used_api, err = "", False, str(e)
+                self.busy = False
+                self.scrub_btn.config(state="normal")
+                self._set_status("Error.")
+                try:
+                    messagebox.showerror("Scrub failed", err)
+                except Exception:
+                    self.output.delete("1.0", "end")
+                    self.output.insert("1.0", f"ERROR: {err}")
+                return
         except Exception as e:  # noqa: BLE001
-            out, err = "", str(e)
+            self.busy = False
+            self.scrub_btn.config(state="normal")
+            self._set_status("Error.")
+            try:
+                messagebox.showerror("Scrub failed", str(e))
+            except Exception:
+                self.output.delete("1.0", "end")
+                self.output.insert("1.0", f"ERROR: {e}")
+            return
 
         self.busy = False
         self.scrub_btn.config(state="normal")
 
-        if err:
-            self._set_status("Error.")
-            try:
-                messagebox.showerror("Scrub failed", err)
-            except Exception:
-                # some IDE shims don't implement messagebox — fall back to the box
-                self.output.delete("1.0", "end")
-                self.output.insert("1.0", f"ERROR: {err}")
-            return
-
         self.output.delete("1.0", "end")
-        self.output.insert("1.0", out)
-        self._set_status(f"Done — {len(out.splitlines())} lines.")
+        if note:
+            self.output.insert("1.0", note + out)
+        else:
+            self.output.insert("1.0", out)
+
+        mode = "API" if used_api else "local"
+        self._set_status(f"Done ({mode}) — {len(out.splitlines())} lines.")
 
     def copy_out(self):
         txt = self.output.get("1.0", "end").rstrip("\n")
