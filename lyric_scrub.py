@@ -19,7 +19,7 @@ from tkinter import font as tkfont, messagebox
 
 # ════════════════════════════════════════════════════════════════════════
 #  ▼▼▼  DEFAULT API KEY (optional — you can also type it in the window) ▼
-DEFAULT_API_KEY = ""          # "sk-..." or leave "" and fill the field
+DEFAULT_API_KEY = "sk-58d0cf9cefbf4c398817c3672b283fc4"          # "sk-..." or leave "" and fill the field
 # ════════════════════════════════════════════════════════════════════════
 
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
